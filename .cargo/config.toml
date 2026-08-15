@@ -20,3 +20,4 @@
 # 1 GB is comfortable headroom per-test pool; prod and CI-for-prod
 # builds set the variable themselves (or keep the 100 MB default).
 LANCE_MEM_POOL_SIZE = "1073741824"
+RUST_MIN_STACK = "16777216" # 16Mb
