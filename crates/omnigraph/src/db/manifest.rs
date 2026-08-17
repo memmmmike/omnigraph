@@ -187,17 +187,13 @@ pub struct SnapshotScanner {
 impl SnapshotScanner {
     /// Select the output columns.
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
-        self.scanner
-            .project(columns)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        self.scanner.project(columns).map_err(OmniError::storage)?;
         Ok(self)
     }
 
     /// Apply a SQL filter expression.
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        self.scanner
-            .filter(filter)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        self.scanner.filter(filter).map_err(OmniError::storage)?;
         Ok(self)
     }
 
@@ -235,7 +231,7 @@ impl SnapshotScanner {
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
         self.scanner
             .limit(limit, offset)
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         Ok(self)
     }
 
@@ -256,7 +252,7 @@ impl SnapshotScanner {
         self.scanner
             .try_into_stream()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 }
 
@@ -277,7 +273,7 @@ impl SnapshotTable {
         self.dataset
             .count_rows(filter)
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 
     /// Lance schema of this pinned table version.
@@ -295,7 +291,7 @@ impl SnapshotTable {
         self.dataset
             .load_indices()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 
     /// Whether `column` has complete usable BTREE coverage.
@@ -517,7 +513,7 @@ async fn probe_dataset_latest_incarnation(
             version: dataset
                 .latest_version_id()
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
+                .map_err(OmniError::storage)?,
             e_tag: dataset.manifest_location().e_tag.clone(),
             timestamp_nanos: Some(dataset.manifest().timestamp_nanos),
         });
@@ -525,7 +521,7 @@ async fn probe_dataset_latest_incarnation(
     let (manifest, location) = dataset
         .latest_manifest()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     Ok(ManifestIncarnation {
         version: manifest.version,
         e_tag: location.e_tag,
@@ -1132,7 +1128,7 @@ impl ManifestCoordinator {
         self.dataset
             .latest_version_id()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(OmniError::storage)
     }
 
     /// Lance-native stable identity for the active manifest branch. Unlike a
@@ -1142,7 +1138,7 @@ impl ManifestCoordinator {
         self.dataset
             .branch_identifier()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(OmniError::storage)
     }
 
     /// Exact materialized `graph_head:<active-branch>` from the same pinned
@@ -1198,10 +1194,7 @@ impl ManifestCoordinator {
 
     pub(crate) async fn delete_branch(&mut self, name: &str) -> Result<()> {
         let mut ds = self.open_branch_control_dataset().await?;
-        let branches = ds
-            .list_branches()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let branches = ds.list_branches().await.map_err(OmniError::storage)?;
         let expected_identifier = branches
             .get(name)
             .ok_or_else(|| OmniError::manifest_not_found(format!("branch '{}' not found", name)))?
@@ -1234,7 +1227,7 @@ impl ManifestCoordinator {
             .dataset
             .list_branches()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
         names.sort();
         let mut all = vec!["main".to_string()];
@@ -1247,7 +1240,7 @@ impl ManifestCoordinator {
             .dataset
             .list_branches()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         let mut frontier = vec![name.to_string()];
         let mut descendants = Vec::new();
         let mut seen = HashSet::new();

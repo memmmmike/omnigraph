@@ -140,9 +140,7 @@ pub(super) async fn init_manifest_graph(
     let manifest_path = manifest_uri(root);
     let dataset = Dataset::write(reader, &manifest_path, Some(params))
         .await
-        .map_err(|e| {
-            ManifestInitError::ManifestCreateOutcomeUnknown(OmniError::Lance(e.to_string()))
-        })?;
+        .map_err(|e| ManifestInitError::ManifestCreateOutcomeUnknown(OmniError::storage(e)))?;
     // Models the object-store shape where the immutable Create landed but its
     // acknowledgement was lost before `Dataset::write` returned success to
     // OmniGraph.  It deliberately sits inside the create half, before the
@@ -176,7 +174,7 @@ pub(super) async fn open_exact_genesis_manifest(
     let graph_head_row_count = head_scanner
         .count_rows()
         .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?;
+        .map_err(OmniError::storage)?;
 
     let stamp = guard_stamp(&dataset)?;
     if stamp != INTERNAL_MANIFEST_SCHEMA_VERSION {
@@ -217,7 +215,6 @@ pub(super) async fn open_exact_genesis_manifest(
             "main graph head does not match this initialization attempt",
         ));
     }
-
     Ok((dataset, known_state, lineage_rows))
 }
 
@@ -277,7 +274,7 @@ pub(super) async fn snapshot_state_at(
     let dataset = dataset
         .checkout_version(version)
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     read_manifest_state(&dataset).await
 }
 
@@ -384,7 +381,7 @@ async fn create_empty_dataset(
     };
     let dataset = Dataset::write(reader, uri, Some(params))
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::storage)?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_TABLE_CREATE_ACK_LOST)?;
     Ok(dataset)
 }

@@ -812,10 +812,9 @@ impl TableStore {
         )
         .await?;
         match branch {
-            Some(branch) if branch != "main" => ds
-                .checkout_branch(branch)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string())),
+            Some(branch) if branch != "main" => {
+                ds.checkout_branch(branch).await.map_err(OmniError::storage)
+            }
             _ => Ok(ds),
         }
     }
@@ -832,10 +831,7 @@ impl TableStore {
             crate::instrumentation::table_wrapper(),
         )
         .await?;
-        let branches = ds
-            .list_branches()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let branches = ds.list_branches().await.map_err(OmniError::storage)?;
         Ok(branches.into_keys().collect())
     }
 
@@ -911,7 +907,7 @@ impl TableStore {
             .await?
             .checkout_version(source_version)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
         let created = match crate::branch_control::create_branch_recoverably(
@@ -959,7 +955,7 @@ impl TableStore {
             .await?
             .try_collect::<Vec<RecordBatch>>()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         let mut materialized = Vec::with_capacity(batches.len());
         for batch in batches {
             materialized.push(self.materialize_blob_batch(ds, batch).await?);
@@ -1120,7 +1116,9 @@ impl TableStore {
             .column_by_name("_rowid")
             .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                OmniError::Lance("expected _rowid column when materializing Blobs".to_string())
+                OmniError::manifest_internal(
+                    "expected _rowid column when materializing Blobs".to_string(),
+                )
             })?
             .values()
             .to_vec();
@@ -1150,7 +1148,9 @@ impl TableStore {
             .column_by_name("_rowid")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| {
-                OmniError::Lance("expected _rowid column when materializing blobs".to_string())
+                OmniError::manifest_internal(
+                    "expected _rowid column when materializing blobs".to_string(),
+                )
             })?
             .values()
             .iter()
@@ -1179,7 +1179,7 @@ impl TableStore {
         supplied_external_payloads: Option<&mut ExternalBlobPayloadCache>,
     ) -> Result<RecordBatch> {
         if batch.num_rows() != row_ids.len() {
-            return Err(OmniError::Lance(format!(
+            return Err(OmniError::manifest_internal(format!(
                 "blob materialization row count {} does not match {} row ids",
                 batch.num_rows(),
                 row_ids.len()
@@ -1213,10 +1213,10 @@ impl TableStore {
         let external_payloads = supplied_external_payloads.unwrap_or(&mut owned_external_payloads);
         let mut columns = Vec::with_capacity(schema.fields().len());
         for field in schema.fields() {
-            let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let lance_field =
+                lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
             let column = batch.column_by_name(field.name()).ok_or_else(|| {
-                OmniError::Lance(format!("batch missing column '{}'", field.name()))
+                OmniError::manifest_internal(format!("batch missing column '{}'", field.name()))
             })?;
             if lance_field.is_blob() {
                 let descriptions =
@@ -1224,7 +1224,7 @@ impl TableStore {
                         .as_any()
                         .downcast_ref::<StructArray>()
                         .ok_or_else(|| {
-                            OmniError::Lance(format!(
+                            OmniError::blob_integrity(format!(
                                 "expected blob descriptions for '{}'",
                                 field.name()
                             ))
@@ -1245,7 +1245,7 @@ impl TableStore {
             }
         }
 
-        RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+        RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
     }
 
     async fn preflight_persisted_blob_batch(
@@ -1297,7 +1297,10 @@ impl TableStore {
                 .column_by_name(&field.name)
                 .and_then(|column| column.as_any().downcast_ref::<StructArray>())
                 .ok_or_else(|| {
-                    OmniError::Lance(format!("expected Blob descriptions for '{}'", field.name))
+                    OmniError::blob_integrity(format!(
+                        "expected Blob descriptions for '{}'",
+                        field.name
+                    ))
                 })?;
             let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
             for row in 0..descriptions.len() {
@@ -1372,42 +1375,36 @@ impl TableStore {
             Arc::new(ds.clone())
                 .take_blobs(&managed_row_ids, column_name)
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .map_err(OmniError::storage)?
         };
 
         let mut managed_files = blob_files.into_iter();
         for descriptor in descriptors {
             match descriptor {
-                BlobDescriptor::Null => builder
-                    .push_null()
-                    .map_err(|error| OmniError::Lance(error.to_string()))?,
+                BlobDescriptor::Null => builder.push_null().map_err(OmniError::storage)?,
                 BlobDescriptor::Managed { length } => {
                     let blob = managed_files
                         .next()
                         .ok_or_else(|| {
-                            OmniError::Lance(format!(
+                            OmniError::blob_integrity(format!(
                                 "Blob rewrite for '{column_name}' lost alignment with source rows"
                             ))
                         })?
                         .ok_or_else(|| {
-                            OmniError::Lance(format!(
+                            OmniError::blob_integrity(format!(
                                 "Blob rewrite for '{column_name}' returned null for a managed descriptor"
                             ))
                         })?;
                     if blob.size() != length {
-                        return Err(OmniError::Lance(format!(
+                        return Err(OmniError::blob_integrity(format!(
                             "Blob rewrite for '{column_name}' observed managed length {}, descriptor recorded {length}",
                             blob.size()
                         )));
                     }
                     crate::instrumentation::record_blob_payload_read();
                     builder
-                        .push_bytes(
-                            blob.read()
-                                .await
-                                .map_err(|error| OmniError::Lance(error.to_string()))?,
-                        )
-                        .map_err(|error| OmniError::Lance(error.to_string()))?;
+                        .push_bytes(blob.read().await.map_err(OmniError::storage)?)
+                        .map_err(OmniError::storage)?;
                 }
                 BlobDescriptor::External {
                     uri,
@@ -1426,21 +1423,19 @@ impl TableStore {
                     };
                     builder
                         .push_bytes(bytes.as_ref())
-                        .map_err(|error| OmniError::Lance(error.to_string()))?;
+                        .map_err(OmniError::storage)?;
                 }
             }
         }
 
         if managed_files.next().is_some() {
-            return Err(OmniError::Lance(format!(
+            return Err(OmniError::blob_integrity(format!(
                 "Blob rewrite for '{}' produced extra managed source blobs",
                 column_name
             )));
         }
 
-        builder
-            .finish()
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        builder.finish().map_err(OmniError::storage)
     }
 
     pub async fn scan_stream(
@@ -1497,25 +1492,18 @@ impl TableStore {
             scanner.with_row_id();
         }
         if let Some(columns) = projection {
-            scanner
-                .project(columns)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            scanner.project(columns).map_err(OmniError::storage)?;
         }
         if let Some(filter_sql) = filter {
-            scanner
-                .filter(filter_sql)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            scanner.filter(filter_sql).map_err(OmniError::storage)?;
         }
         if let Some(ordering) = order_by {
             scanner
                 .order_by(Some(ordering))
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+                .map_err(OmniError::storage)?;
         }
         configure(&mut scanner)?;
-        scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        scanner.try_into_stream().await.map_err(OmniError::storage)
     }
 
     pub async fn scan(
@@ -1529,7 +1517,7 @@ impl TableStore {
             .await?
             .try_collect()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(OmniError::storage)
     }
 
     pub async fn scan_with<F>(
@@ -1548,7 +1536,7 @@ impl TableStore {
             .await?
             .try_collect()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(OmniError::storage)
     }
 
     /// Indexed neighbor lookup for graph traversal. Given an edge dataset and a
@@ -1611,7 +1599,7 @@ impl TableStore {
         .await?
         .try_collect()
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+        .map_err(OmniError::storage)
     }
 
     /// Metadata-only check (no IO) of whether `scan_edges_by_endpoint` — a
@@ -1628,10 +1616,7 @@ impl TableStore {
                 reason: format!("column '{}' not in schema", column),
             });
         };
-        let indices = ds
-            .load_indices()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
         let btree = indices
             .iter()
             .filter(|index| !is_system_index(index))
@@ -1691,10 +1676,7 @@ impl TableStore {
     /// Used by `optimize` to decide whether an otherwise-already-compacted
     /// table still has index work to do.
     pub async fn has_unindexed_fragments(ds: &Dataset) -> Result<bool> {
-        let indices = ds
-            .load_indices()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
         let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
         for index in indices.iter() {
             if is_system_index(index) {
@@ -1710,9 +1692,7 @@ impl TableStore {
     }
 
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
-        ds.count_rows(filter)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        ds.count_rows(filter).await.map_err(OmniError::storage)
     }
 
     pub fn dataset_version(&self, ds: &Dataset) -> u64 {
@@ -1757,7 +1737,7 @@ impl TableStore {
         };
         ds.append(reader, Some(params))
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         self.table_state(dataset_uri, ds).await
     }
 
@@ -1778,7 +1758,7 @@ impl TableStore {
                 };
                 ds.append(reader, Some(params))
                     .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+                    .map_err(OmniError::storage)?;
                 Ok(ds)
             }
             None => {
@@ -1795,7 +1775,7 @@ impl TableStore {
                 };
                 Dataset::write(reader, dataset_uri, Some(params))
                     .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))
+                    .map_err(OmniError::storage)
             }
         }
     }
@@ -1817,7 +1797,7 @@ impl TableStore {
         let uncommitted = DeleteBuilder::new(Arc::new(ds.clone()), filter)
             .execute_uncommitted()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
 
         if uncommitted.num_deleted_rows == 0 {
             return Ok(None);
@@ -1924,7 +1904,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         // Record only after the staging write succeeds, so a failed write does
         // not inflate the probe (matches `stage_append_stream`'s ordering).
         crate::instrumentation::record_stage_append(appended_rows);
@@ -1991,7 +1971,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted_stream(stream)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         let mut new_fragments = match &transaction.operation {
             Operation::Append { fragments } => fragments.clone(),
             Operation::Overwrite { fragments, .. } => fragments.clone(),
@@ -2223,7 +2203,7 @@ impl TableStore {
         for id in &source_ids {
             filter_builder
                 .insert(KeyValue::String(id.clone()))
-                .map_err(|error| OmniError::Lance(error.to_string()))?;
+                .map_err(OmniError::storage)?;
         }
         if filter_builder.len() != batch.num_rows()
             || source_ids
@@ -2259,7 +2239,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         if transaction.read_version != expected_read_version {
             return Err(OmniError::manifest_internal(format!(
                 "{context} wrote against version {}, expected {expected_read_version}",
@@ -2433,11 +2413,7 @@ impl TableStore {
         exact_id_primary_key_field_id(source, "stage_keyed_write_stream source")?;
         let mut id_stream = Self::scan_stream(source, Some(&["id"]), None, None, false).await?;
         let mut merged_rows = 0_u64;
-        while let Some(batch) = id_stream
-            .try_next()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
-        {
+        while let Some(batch) = id_stream.try_next().await.map_err(OmniError::storage)? {
             merged_rows = merged_rows
                 .checked_add(batch.num_rows() as u64)
                 .ok_or_else(|| {
@@ -2506,11 +2482,7 @@ impl TableStore {
                 Ok(())
             })
             .await?;
-        while let Some(batch) = target_ids
-            .try_next()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
-        {
+        while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
             let ids = string_id_column(&batch, "stage_keyed_write strict preflight")?;
             for row in 0..ids.len() {
                 if ids.is_valid(row) {
@@ -2531,7 +2503,7 @@ impl TableStore {
         context: &'static str,
     ) -> Result<(StagedWrite, MergeStats)> {
         let mut builder = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
         builder.when_matched(match semantics {
             KeyedWriteSemantics::StrictInsert => WhenMatched::Fail,
             KeyedWriteSemantics::Upsert | KeyedWriteSemantics::KnownPresentUpdate => {
@@ -2559,10 +2531,10 @@ impl TableStore {
         builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
         let uncommitted = builder
             .try_build()
-            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .map_err(OmniError::storage)?
             .execute_uncommitted(stream)
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
 
         match semantics {
             KeyedWriteSemantics::StrictInsert => {
@@ -2763,11 +2735,7 @@ impl TableStore {
         let mut raw =
             Self::scan_proven_insert_blob_row_ids(source, begin_version, end_version).await?;
         let mut observed_rows = 0_u64;
-        while let Some(batch) = raw
-            .try_next()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
-        {
+        while let Some(batch) = raw.try_next().await.map_err(OmniError::datafusion)? {
             let row_ids = batch
                 .column_by_name("_rowid")
                 .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
@@ -2780,7 +2748,7 @@ impl TableStore {
                 let descriptors = source
                     .take_rows(&[row_ids.value(row)], source.schema().clone())
                     .await
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                    .map_err(OmniError::storage)?;
                 selection.include_batch(&descriptors)?;
                 observed_rows = observed_rows.checked_add(1).ok_or_else(|| {
                     OmniError::manifest_internal(
@@ -2883,8 +2851,8 @@ impl TableStore {
         check_batch_unique_by_keys(&batch, &key_columns, "stage_merge_insert")?;
 
         let ds = Arc::new(ds);
-        let mut builder = MergeInsertBuilder::try_new(ds, key_columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut builder =
+            MergeInsertBuilder::try_new(ds, key_columns).map_err(OmniError::storage)?;
         builder.when_matched(when_matched);
         builder.when_not_matched(when_not_matched);
         // Workaround for a Lance bug class where sequential merge_insert calls
@@ -2903,16 +2871,14 @@ impl TableStore {
         // walk in `exec/merge.rs`). Retire when upstream Lance fixes the bug
         // class. Tracked at MR-957; upstream: lance-format/lance#6877.
         builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
-        let job = builder
-            .try_build()
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let job = builder.try_build().map_err(OmniError::storage)?;
         let schema = batch.schema();
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
         let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
         let uncommitted = job
             .execute_uncommitted(stream)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         // Record only after the staging write succeeds, so a failed write does
         // not inflate the probe (matches `stage_append`/`stage_append_stream`).
         crate::instrumentation::record_stage_merge_insert(merged_rows);
@@ -3026,11 +2992,11 @@ impl TableStore {
             .with_max_retries(0)
             .execute(staged.transaction)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         let committed_identity = dataset
             .read_transaction()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .map_err(OmniError::storage)?
             .as_ref()
             .map(StagedTransactionIdentity::from)
             .ok_or_else(|| {
@@ -3070,7 +3036,7 @@ impl TableStore {
             dataset
                 .read_transaction()
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .map_err(OmniError::storage)?
                 .as_ref()
                 .map(StagedTransactionIdentity::from)
         } else {
@@ -3101,7 +3067,7 @@ impl TableStore {
             .with_params(&params)
             .execute_uncommitted(vec![batch])
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         if transaction.read_version != 0 {
             return Err(OmniError::manifest_internal(format!(
                 "stage_create resolved '{}' at existing version {}; expected an absent dataset",
@@ -3142,8 +3108,8 @@ impl TableStore {
         // Lance's row-id-lineage spec, so this stays correct for legacy
         // datasets.
         let (transaction, mut new_fragments) = if batch.num_rows() == 0 {
-            let schema = LanceSchema::try_from(batch.schema().as_ref())
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let schema =
+                LanceSchema::try_from(batch.schema().as_ref()).map_err(OmniError::storage)?;
             let transaction = TransactionBuilder::new(
                 ds.manifest.version,
                 Operation::Overwrite {
@@ -3168,7 +3134,7 @@ impl TableStore {
                 .with_params(&params)
                 .execute_uncommitted(vec![batch])
                 .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+                .map_err(OmniError::storage)?;
             let new_fragments = match &transaction.operation {
                 Operation::Overwrite { fragments, .. } => fragments.clone(),
                 other => {
@@ -3235,7 +3201,7 @@ impl TableStore {
         let existing_indices = ds
             .load_indices()
             .await
-            .map_err(|e| OmniError::Lance(format!("stage_create_indices: {e}")))?;
+            .map_err(|error| OmniError::storage_context("stage_create_indices", error))?;
         let mut new_indices = Vec::with_capacity(specs.len());
         let mut new_names = std::collections::HashSet::with_capacity(specs.len());
         let mut vector_builds = 0usize;
@@ -3289,10 +3255,11 @@ impl TableStore {
                     new_idx
                 }
             }
-            .map_err(|e| {
-                OmniError::Lance(format!(
-                    "stage_create_indices: build {index_type} index on '{column}': {e}"
-                ))
+            .map_err(|error| {
+                OmniError::storage_context(
+                    format!("stage_create_indices: build {index_type} index on '{column}'"),
+                    error,
+                )
             })?;
 
             if new_idx.dataset_version != read_version {
@@ -3375,24 +3342,17 @@ impl TableStore {
         let mut scanner = ds.scan();
         if let Some(cols) = projection {
             let owned: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-            scanner
-                .project(&owned)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            scanner.project(&owned).map_err(OmniError::storage)?;
         }
         if let Some(f) = filter {
-            scanner
-                .filter(f)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            scanner.filter(f).map_err(OmniError::storage)?;
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         let stream = scanner
             .try_into_stream()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        stream
-            .try_collect()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(OmniError::storage)?;
+        stream.try_collect().await.map_err(OmniError::storage)
     }
 
     /// Scan committed via Lance + apply the same filter to in-memory
@@ -3454,7 +3414,7 @@ impl TableStore {
         // `key_column` if union is what they wanted.
         if let (Some(key_col), Some(cols)) = (key_column, projection) {
             if !cols.contains(&key_col) {
-                return Err(OmniError::Lance(format!(
+                return Err(OmniError::manifest_internal(format!(
                     "scan_with_pending: key_column '{}' must appear in projection \
                      when merge-shadow semantics are requested (got projection = {:?})",
                     key_col, cols
@@ -3493,11 +3453,7 @@ impl TableStore {
             .await?;
 
         let mut committed = Vec::new();
-        while let Some(batch) = stream
-            .try_next()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
-        {
+        while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
             let batch = if let Some(key_col) = key_column
                 && !pending_keys.is_empty()
             {
@@ -3613,11 +3569,7 @@ impl TableStore {
         .await?;
 
         let mut committed = Vec::new();
-        while let Some(batch) = matched
-            .try_next()
-            .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?
-        {
+        while let Some(batch) = matched.try_next().await.map_err(OmniError::storage)? {
             // Shadow before row charging and before any blob handle/read. A
             // prior pending row owns the logical id even when it no longer
             // matches this update predicate.
@@ -3646,7 +3598,9 @@ impl TableStore {
                 .column_by_name("_rowid")
                 .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
                 .ok_or_else(|| {
-                    OmniError::Lance("expected _rowid in predicate-matched blob scan".to_string())
+                    OmniError::manifest_internal(
+                        "expected _rowid in predicate-matched blob scan".to_string(),
+                    )
                 })?
                 .values()
                 .to_vec();
@@ -3656,7 +3610,7 @@ impl TableStore {
             let descriptors = committed_ds
                 .take_rows(&row_ids, committed_ds.schema().clone())
                 .await
-                .map_err(|error| OmniError::Lance(error.to_string()))?;
+                .map_err(OmniError::storage)?;
             let materialized = match self
                 .materialize_blob_batch_with_row_ids(
                     committed_ds,
@@ -3709,15 +3663,10 @@ impl TableStore {
         }
         let mut scanner = ds.scan();
         if let Some(f) = filter {
-            scanner
-                .filter(&f)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            scanner.filter(&f).map_err(OmniError::storage)?;
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
-        let count = scanner
-            .count_rows()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let count = scanner.count_rows().await.map_err(OmniError::storage)?;
         Ok(count as usize)
     }
 
@@ -3732,10 +3681,7 @@ impl TableStore {
                     column
                 ))
             })?;
-        let indices = ds
-            .load_indices()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
         Ok(indices
             .iter()
             .filter(|index| !is_system_index(index))
@@ -3799,7 +3745,7 @@ impl TableStore {
             .await?
             .try_collect::<Vec<RecordBatch>>()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::storage)?;
         Ok(batches.iter().find_map(|batch| {
             batch
                 .column_by_name("_rowid")
@@ -3823,7 +3769,7 @@ impl TableStore {
         };
         Dataset::write(reader, dataset_uri, Some(params))
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(OmniError::storage)
     }
 }
 
@@ -3833,7 +3779,7 @@ fn map_lance_commit_error(error: lance::Error) -> OmniError {
         | lance::Error::TooMuchWriteContention { .. }) => {
             OmniError::RetryableCommitConflict(error.to_string())
         }
-        error => OmniError::Lance(error.to_string()),
+        error => OmniError::storage(error),
     }
 }
 
@@ -4069,7 +4015,7 @@ fn non_blob_column_bytes(ds: &Dataset, batch: &RecordBatch) -> Result<u64> {
         .filter(|field| !field.is_blob())
         .try_fold(0_u64, |total, field| {
             let column = batch.column_by_name(&field.name).ok_or_else(|| {
-                OmniError::Lance(format!("batch missing column '{}'", field.name))
+                OmniError::manifest_internal(format!("batch missing column '{}'", field.name))
             })?;
             let bytes = u64::try_from(column.get_array_memory_size()).map_err(|_| {
                 OmniError::manifest_internal("non-blob pending scan bytes exceed u64")
@@ -4092,13 +4038,13 @@ fn collect_string_column_values(
     let mut out = std::collections::HashSet::new();
     for batch in batches {
         let Some(col) = batch.column_by_name(column) else {
-            return Err(OmniError::Lance(format!(
+            return Err(OmniError::manifest_internal(format!(
                 "scan_with_pending: pending batch missing key column '{}'",
                 column
             )));
         };
         let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            OmniError::Lance(format!(
+            OmniError::manifest_internal(format!(
                 "scan_with_pending: key column '{}' is not Utf8",
                 column
             ))
@@ -4140,7 +4086,7 @@ fn filter_out_rows_where_string_in(
             ))
         })?;
         let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            OmniError::Lance(format!(
+            OmniError::manifest_internal(format!(
                 "scan_with_pending: committed column '{}' is not Utf8",
                 column
             ))
@@ -4155,7 +4101,7 @@ fn filter_out_rows_where_string_in(
             })
             .collect();
         let filtered = arrow_select::filter::filter_record_batch(&batch, &mask)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(OmniError::arrow_internal)?;
         out.push(filtered);
     }
     Ok(out)
@@ -4193,9 +4139,9 @@ async fn scan_pending_batches(
     config.options_mut().sql_parser.enable_ident_normalization = false;
     let ctx = datafusion::execution::context::SessionContext::new_with_config(config);
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![pending_batches.to_vec()])
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::datafusion)?;
     ctx.register_table("pending", Arc::new(mem))
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(OmniError::datafusion)?;
 
     let proj = projection
         .map(|cols| {
@@ -4207,13 +4153,8 @@ async fn scan_pending_batches(
         .unwrap_or_else(|| "*".to_string());
     let where_clause = filter.map(|f| format!("WHERE {f}")).unwrap_or_default();
     let sql = format!("SELECT {proj} FROM pending {where_clause}");
-    let df = ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    df.collect()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    let df = ctx.sql(&sql).await.map_err(OmniError::datafusion)?;
+    df.collect().await.map_err(OmniError::datafusion)
 }
 
 // Staged-write helper retained alongside the sealed storage surface; its
@@ -4289,8 +4230,8 @@ fn append_persisted_blob_selection(
     batch: &RecordBatch,
 ) -> Result<()> {
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let lance_field =
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
         if !lance_field.is_blob() {
             continue;
         }
@@ -4298,7 +4239,7 @@ fn append_persisted_blob_selection(
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| {
-                OmniError::Lance(format!(
+                OmniError::blob_integrity(format!(
                     "persisted Blob descriptor '{}' is not a struct",
                     field.name()
                 ))
@@ -4331,8 +4272,8 @@ fn visit_external_blob_uris<'a>(
     mut visit: impl FnMut(&'a str) -> Result<()>,
 ) -> Result<()> {
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let lance_field =
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
         if !lance_field.is_blob() {
             continue;
         }
@@ -4401,8 +4342,8 @@ fn canonicalize_external_blob_inputs(
     let schema = batch.schema();
     let mut columns = Vec::with_capacity(batch.num_columns());
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let lance_field =
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
         if !lance_field.is_blob() {
             columns.push(column.clone());
             continue;
@@ -4432,7 +4373,7 @@ fn canonicalize_external_blob_inputs(
             descriptions.nulls().cloned(),
         )) as ArrayRef);
     }
-    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
 /// Materialize logical external-URI Blob cells before keyed merge-insert.
@@ -4460,8 +4401,8 @@ async fn materialize_external_blob_inputs(
     let mut columns = Vec::with_capacity(batch.num_columns());
     let mut external_payloads: HashMap<String, Arc<[u8]>> = HashMap::new();
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let lance_field =
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
         if !lance_field.is_blob() {
             columns.push(column.clone());
             continue;
@@ -4474,13 +4415,11 @@ async fn materialize_external_blob_inputs(
         let mut builder = BlobArrayBuilder::new(descriptions.len());
         for row in 0..descriptions.len() {
             if descriptions.is_null(row) {
-                builder
-                    .push_null()
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                builder.push_null().map_err(OmniError::storage)?;
             } else if input.data.is_valid(row) {
                 builder
                     .push_bytes(input.data.value(row))
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                    .map_err(OmniError::storage)?;
             } else {
                 let uri = input.uris.value(row);
                 let entry = preflight.entry(uri)?;
@@ -4495,16 +4434,12 @@ async fn materialize_external_blob_inputs(
                 };
                 builder
                     .push_bytes(bytes.as_ref())
-                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                    .map_err(OmniError::storage)?;
             }
         }
-        columns.push(
-            builder
-                .finish()
-                .map_err(|error| OmniError::Lance(error.to_string()))?,
-        );
+        columns.push(builder.finish().map_err(OmniError::storage)?);
     }
-    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+    RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
 /// The provenance scanner copies every source blob into a logical in-memory
@@ -4515,8 +4450,8 @@ async fn materialize_external_blob_inputs(
 /// target dataset.
 fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &str) -> Result<()> {
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let lance_field =
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::storage)?;
         if !lance_field.is_blob() {
             continue;
         }
@@ -4824,7 +4759,7 @@ fn certify_insert_absence(
     for id in source_ids {
         expected_filter
             .insert(KeyValue::String(id.clone()))
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::storage)?;
     }
     if expected_filter.len() != source_ids.len()
         || source_ids
@@ -5188,7 +5123,7 @@ fn proven_insert_slice_memory_size(batch: &RecordBatch, offset: usize, rows: usi
             .slice(offset, rows)
             .to_data()
             .get_slice_memory_size()
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(OmniError::arrow_internal)?;
         total
             .checked_add(u64::try_from(bytes).map_err(|_| {
                 OmniError::manifest_internal("proven insert logical slice bytes exceed u64")
@@ -5207,8 +5142,7 @@ fn finish_proven_insert_batch(
     let batch = if batches.len() == 1 {
         batches.pop().expect("length checked")
     } else {
-        arrow_select::concat::concat_batches(schema, &batches)
-            .map_err(|error| OmniError::Lance(error.to_string()))?
+        arrow_select::concat::concat_batches(schema, &batches).map_err(OmniError::arrow_internal)?
     };
     validate_proven_insert_source_batch(&batch, table_key)?;
     Ok(batch)
@@ -5227,8 +5161,7 @@ fn copy_proven_insert_batch_range(
     let end = u64::try_from(end)
         .map_err(|_| OmniError::manifest_internal("proven insert delta end exceeds u64"))?;
     let indices = UInt64Array::from_iter_values(offset..end);
-    arrow_select::take::take_record_batch(batch, &indices)
-        .map_err(|error| OmniError::Lance(error.to_string()))
+    arrow_select::take::take_record_batch(batch, &indices).map_err(OmniError::arrow_internal)
 }
 
 fn validate_proven_insert_source_batch(batch: &RecordBatch, table_key: &str) -> Result<()> {
